@@ -75,6 +75,58 @@ def geosearch(lat, lon, radius_m=GS_MAX_RADIUS):
     return results
 
 
+# Minimum search radius before we stop subdividing (metres).
+# Wikipedia's API requires gsradius >= 10, but below ~200m further
+# subdivision is unlikely to help.
+MIN_SUBDIV_RADIUS = 200
+
+
+def geosearch_adaptive(lat, lon, radius_m, seen_pageids, depth=0):
+    """Query Wikipedia geosearch, automatically subdividing on overflow.
+
+    When a query returns the maximum 500 results, the area is split into
+    four quadrants and each is re-queried at half the radius. This recurses
+    until queries no longer overflow or the radius drops below MIN_SUBDIV_RADIUS.
+
+    Returns a list of result dicts, deduplicating against seen_pageids.
+    seen_pageids is updated in place.
+    """
+    radius_m = min(radius_m, GS_MAX_RADIUS)
+    indent = "    " * depth
+
+    time.sleep(0.3)  # rate-limit
+    results = geosearch(lat, lon, radius_m)
+
+    if len(results) < GS_MAX_RESULTS or radius_m <= MIN_SUBDIV_RADIUS:
+        # Didn't overflow, or can't subdivide further — return what we have
+        new_results = []
+        for r in results:
+            if r["pageid"] not in seen_pageids:
+                seen_pageids.add(r["pageid"])
+                new_results.append(r)
+        return new_results
+
+    # Hit the 500-result limit — subdivide into 4 quadrants
+    sub_radius = radius_m / 2
+    offset_m = radius_m / 2
+    offset_lat = offset_m / metres_per_degree_lat()
+    m_per_deg_lon = metres_per_degree_lon(lat)
+    offset_lon = offset_m / m_per_deg_lon if m_per_deg_lon > 0 else offset_m
+
+    print(f"{indent}    ↳ overflow at {radius_m/1000:.1f}km, subdividing into 4 × {sub_radius/1000:.1f}km",
+          file=sys.stderr)
+
+    all_new = []
+    for dlat_sign in (-1, 1):
+        for dlon_sign in (-1, 1):
+            sub_lat = lat + dlat_sign * offset_lat
+            sub_lon = lon + dlon_sign * offset_lon
+            sub_results = geosearch_adaptive(sub_lat, sub_lon, sub_radius, seen_pageids, depth + 1)
+            all_new.extend(sub_results)
+
+    return all_new
+
+
 def metres_per_degree_lat():
     """Approximate metres per degree of latitude."""
     return 111_320.0
@@ -138,38 +190,17 @@ def scan_area(center_lat, center_lon, radius_m):
 
     seen_pageids = set()
     all_entries = []
-    queries_at_limit = 0
 
     for idx, (lat, lon) in enumerate(grid, 1):
-        print(f"  Grid point {idx}/{total_points}: ({lat:.4f}, {lon:.4f})", file=sys.stderr, end="")
+        print(f"  Grid point {idx}/{total_points}: ({lat:.4f}, {lon:.4f})", file=sys.stderr)
 
         try:
-            results = geosearch(lat, lon, query_radius)
+            new_results = geosearch_adaptive(lat, lon, query_radius, seen_pageids)
+            all_entries.extend(new_results)
+            print(f"    {len(new_results)} new entries (total: {len(all_entries)})", file=sys.stderr)
         except Exception as e:
-            print(f" ERROR: {e}", file=sys.stderr)
+            print(f"    ERROR: {e}", file=sys.stderr)
             continue
-
-        new_count = 0
-        for r in results:
-            pid = r["pageid"]
-            if pid not in seen_pageids:
-                seen_pageids.add(pid)
-                all_entries.append(r)
-                new_count += 1
-
-        print(f" → {len(results)} results, {new_count} new (total: {len(all_entries)})", file=sys.stderr)
-
-        if len(results) >= GS_MAX_RESULTS:
-            queries_at_limit += 1
-
-        # Rate-limit: be polite to the Wikipedia API
-        if idx < total_points:
-            time.sleep(0.5)
-
-    if queries_at_limit:
-        print(f"\n  Warning: {queries_at_limit} grid points hit the {GS_MAX_RESULTS}-result limit.", file=sys.stderr)
-        print(f"  Some entries may have been missed in dense areas.", file=sys.stderr)
-        print(f"  Consider re-running with a smaller radius for those areas.\n", file=sys.stderr)
 
     return all_entries
 
