@@ -13,9 +13,10 @@ The output filename defaults to mrs-entries_LAT_LON_RADIUSm.json
 """
 
 import argparse
+import base64
+import hashlib
 import json
 import math
-import secrets
 import sys
 import time
 import urllib.request
@@ -32,9 +33,15 @@ GS_MAX_RESULTS = 500
 POI_RADIUS = 100.0
 
 
-def generate_id():
-    """Generate a registration ID: reg_ + 12 URL-safe characters."""
-    return "reg_" + secrets.token_urlsafe(9)[:12]
+def deterministic_id(source_key):
+    """Generate a deterministic registration ID from a source key.
+
+    Uses SHA-256 hash of the key, base64url-encoded, so the same
+    Wikipedia article always produces the same reg ID across runs.
+    """
+    h = hashlib.sha256(source_key.encode()).digest()
+    b64 = base64.urlsafe_b64encode(h).decode("ascii")
+    return "reg_" + b64[:12]
 
 
 def fetch_url(url, retries=3, delay=2):
@@ -223,7 +230,7 @@ def build_registrations(entries):
         lon = entry["lon"]
         wiki_url = f"https://en.wikipedia.org/wiki/{urllib.parse.quote(title.replace(' ', '_'))}"
 
-        reg_id = generate_id()
+        reg_id = deterministic_id(f"wpid:{entry['pageid']}")
         registrations.append({
             "id": reg_id,
             "owner": "mpesce@owen.iz.net",
