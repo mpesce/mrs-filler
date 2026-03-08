@@ -106,7 +106,15 @@ def geosearch_adaptive(lat, lon, radius_m, seen_pageids, depth=0):
                 new_results.append(r)
         return new_results
 
-    # Hit the 500-result limit — subdivide into 4 quadrants
+    # Hit the 500-result limit — keep these results, then subdivide for more.
+    # The original query captured entries near the centre; the sub-queries
+    # will find entries further out that were beyond the 500-result cutoff.
+    all_new = []
+    for r in results:
+        if r["pageid"] not in seen_pageids:
+            seen_pageids.add(r["pageid"])
+            all_new.append(r)
+
     sub_radius = radius_m / 2
     offset_m = radius_m / 2
     offset_lat = offset_m / metres_per_degree_lat()
@@ -116,7 +124,6 @@ def geosearch_adaptive(lat, lon, radius_m, seen_pageids, depth=0):
     print(f"{indent}    ↳ overflow at {radius_m/1000:.1f}km, subdividing into 4 × {sub_radius/1000:.1f}km",
           file=sys.stderr)
 
-    all_new = []
     for dlat_sign in (-1, 1):
         for dlon_sign in (-1, 1):
             sub_lat = lat + dlat_sign * offset_lat
