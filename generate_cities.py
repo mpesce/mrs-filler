@@ -169,8 +169,8 @@ def build_registrations(cities):
             wiki_url = f"https://en.wikipedia.org/wiki/{slug}"
 
         radius = estimate_radius_meters(city["population"], city.get("area_km2"))
-        # Clamp radius to schema limits (> 0, <= 1,000,000 meters)
-        radius = max(100, min(radius, 1_000_000))
+        # Clamp radius: minimum 100m, maximum 100km
+        radius = max(100, min(radius, 100_000))
 
         reg_id = generate_id()
         registrations.append({
