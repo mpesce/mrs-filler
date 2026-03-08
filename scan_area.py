@@ -1,0 +1,257 @@
+#!/usr/bin/env python3
+"""Scan a geographic area and collect all geolocated Wikipedia entries.
+
+Performs a grid sweep across a square centred on the given coordinates,
+querying Wikipedia's geosearch API at each grid point to discover every
+geolocated article. Results are deduplicated and written as MRS-format
+JSON ready for import into an MRS server.
+
+Usage:
+    python scan_area.py --lat LAT --lon LON --radius RADIUS_KM [-o OUTPUT]
+
+The output filename defaults to mrs-entries_LAT_LON_RADIUSm.json
+"""
+
+import argparse
+import json
+import math
+import secrets
+import sys
+import time
+import urllib.request
+import urllib.parse
+from datetime import datetime, timezone
+
+USER_AGENT = "MRS-Area-Scanner/1.0 (contact: mpesce@owen.iz.net)"
+
+# Wikipedia geosearch API limits
+GS_MAX_RADIUS = 10000  # metres
+GS_MAX_RESULTS = 500
+
+# Each Wikipedia POI gets this radius in the MRS registration (metres)
+POI_RADIUS = 100.0
+
+
+def generate_id():
+    """Generate a registration ID: reg_ + 12 URL-safe characters."""
+    return "reg_" + secrets.token_urlsafe(9)[:12]
+
+
+def fetch_url(url, retries=3, delay=2):
+    """Fetch a URL with retries."""
+    for attempt in range(retries):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+            with urllib.request.urlopen(req, timeout=30) as response:
+                return response.read().decode("utf-8")
+        except Exception as e:
+            if attempt < retries - 1:
+                wait = delay * (attempt + 1)
+                print(f"  Retry {attempt + 1}/{retries}: {e} (waiting {wait}s)", file=sys.stderr)
+                time.sleep(wait)
+            else:
+                raise
+
+
+def geosearch(lat, lon, radius_m=GS_MAX_RADIUS):
+    """Query Wikipedia geosearch API for articles near a point.
+
+    Returns a list of dicts with keys: pageid, title, lat, lon, dist.
+    """
+    radius_m = min(radius_m, GS_MAX_RADIUS)
+    params = urllib.parse.urlencode({
+        "action": "query",
+        "list": "geosearch",
+        "gscoord": f"{lat}|{lon}",
+        "gsradius": int(radius_m),
+        "gslimit": GS_MAX_RESULTS,
+        "format": "json",
+        "formatversion": "2",
+    })
+    url = f"https://en.wikipedia.org/w/api.php?{params}"
+    raw = fetch_url(url)
+    data = json.loads(raw)
+    results = data.get("query", {}).get("geosearch", [])
+    return results
+
+
+def metres_per_degree_lat():
+    """Approximate metres per degree of latitude."""
+    return 111_320.0
+
+
+def metres_per_degree_lon(lat):
+    """Approximate metres per degree of longitude at a given latitude."""
+    return 111_320.0 * math.cos(math.radians(lat))
+
+
+def generate_grid(center_lat, center_lon, radius_m):
+    """Generate grid points covering a square of side 2*radius_m centred on the point.
+
+    Uses a step size that ensures full coverage with 10km search circles.
+    The step is R*sqrt(2) ≈ 14.14km so that the corners of each grid cell
+    are within the search radius. We use a conservative 12km step for safety.
+    """
+    step_m = GS_MAX_RADIUS * 1.2  # 12km step for good overlap with 10km search radius
+
+    # Convert step to degrees
+    step_lat = step_m / metres_per_degree_lat()
+    step_lon = step_m / metres_per_degree_lon(center_lat) if metres_per_degree_lon(center_lat) > 0 else step_m / 1.0
+
+    # Number of steps in each direction from centre
+    n_lat = math.ceil(radius_m / step_m)
+    n_lon = math.ceil(radius_m / step_m)
+
+    points = []
+    for i in range(-n_lat, n_lat + 1):
+        for j in range(-n_lon, n_lon + 1):
+            lat = center_lat + i * step_lat
+            lon = center_lon + j * step_lon
+            # Clamp to valid ranges
+            lat = max(-90.0, min(90.0, lat))
+            lon = max(-180.0, min(180.0, lon))
+            points.append((lat, lon))
+
+    return points
+
+
+def scan_area(center_lat, center_lon, radius_m):
+    """Scan a square area and collect all unique Wikipedia geolocated entries."""
+    grid = generate_grid(center_lat, center_lon, radius_m)
+    total_points = len(grid)
+    print(f"Scanning {total_points} grid points over {radius_m/1000:.1f}km radius...", file=sys.stderr)
+
+    seen_pageids = set()
+    all_entries = []
+    queries_at_limit = 0
+
+    for idx, (lat, lon) in enumerate(grid, 1):
+        print(f"  Grid point {idx}/{total_points}: ({lat:.4f}, {lon:.4f})", file=sys.stderr, end="")
+
+        try:
+            results = geosearch(lat, lon, GS_MAX_RADIUS)
+        except Exception as e:
+            print(f" ERROR: {e}", file=sys.stderr)
+            continue
+
+        new_count = 0
+        for r in results:
+            pid = r["pageid"]
+            if pid not in seen_pageids:
+                seen_pageids.add(pid)
+                all_entries.append(r)
+                new_count += 1
+
+        print(f" → {len(results)} results, {new_count} new (total: {len(all_entries)})", file=sys.stderr)
+
+        if len(results) >= GS_MAX_RESULTS:
+            queries_at_limit += 1
+
+        # Rate-limit: be polite to the Wikipedia API
+        if idx < total_points:
+            time.sleep(0.5)
+
+    if queries_at_limit:
+        print(f"\n  Warning: {queries_at_limit} grid points hit the {GS_MAX_RESULTS}-result limit.", file=sys.stderr)
+        print(f"  Some entries may have been missed in dense areas.", file=sys.stderr)
+        print(f"  Consider re-running with a smaller radius for those areas.\n", file=sys.stderr)
+
+    return all_entries
+
+
+def build_registrations(entries):
+    """Build MRS registration objects from Wikipedia geosearch results."""
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    registrations = []
+
+    for entry in entries:
+        title = entry["title"]
+        lat = entry["lat"]
+        lon = entry["lon"]
+        wiki_url = f"https://en.wikipedia.org/wiki/{urllib.parse.quote(title.replace(' ', '_'))}"
+
+        reg_id = generate_id()
+        registrations.append({
+            "id": reg_id,
+            "owner": "mpesce@owen.iz.net",
+            "space": {
+                "type": "sphere",
+                "center": {
+                    "lat": round(lat, 6),
+                    "lon": round(lon, 6),
+                    "ele": 0.0,
+                },
+                "radius": POI_RADIUS,
+            },
+            "service_point": wiki_url,
+            "foad": False,
+            "origin_server": "https://owen.iz.net",
+            "origin_id": reg_id,
+            "version": 1,
+            "created": now,
+            "updated": now,
+        })
+
+    return registrations
+
+
+def default_filename(lat, lon, radius_m):
+    """Generate default output filename from parameters."""
+    return f"mrs-entries_{lat:.4f}_{lon:.4f}_{int(radius_m)}m.json"
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Scan a geographic area and collect all geolocated Wikipedia entries as MRS registrations."
+    )
+    parser.add_argument("--lat", type=float, required=True, help="Centre latitude")
+    parser.add_argument("--lon", type=float, required=True, help="Centre longitude")
+    parser.add_argument("--radius", type=float, required=True, help="Scan radius in kilometres")
+    parser.add_argument("-o", "--output", type=str, default=None, help="Output filename (auto-generated if omitted)")
+    args = parser.parse_args()
+
+    radius_m = args.radius * 1000  # Convert km to metres
+
+    if not (-90 <= args.lat <= 90):
+        print("Error: latitude must be between -90 and 90", file=sys.stderr)
+        sys.exit(1)
+    if not (-180 <= args.lon <= 180):
+        print("Error: longitude must be between -180 and 180", file=sys.stderr)
+        sys.exit(1)
+    if radius_m <= 0:
+        print("Error: radius must be positive", file=sys.stderr)
+        sys.exit(1)
+
+    output_file = args.output or default_filename(args.lat, args.lon, radius_m)
+
+    # Step 1: Scan the area
+    entries = scan_area(args.lat, args.lon, radius_m)
+    print(f"\nFound {len(entries)} unique Wikipedia entries", file=sys.stderr)
+
+    if not entries:
+        print("No entries found. Nothing to write.", file=sys.stderr)
+        sys.exit(0)
+
+    # Step 2: Build registrations
+    print("Building registrations...", file=sys.stderr)
+    registrations = build_registrations(entries)
+
+    # Step 3: Assemble output
+    output = {
+        "mrs_version": "1.0",
+        "exported_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "server": "https://owen.iz.net",
+        "registrations": registrations,
+        "tombstones": [],
+        "peers": [],
+    }
+
+    # Step 4: Write
+    with open(output_file, "w", encoding="utf-8") as f:
+        json.dump(output, f, indent=2, ensure_ascii=False)
+
+    print(f"Wrote {len(registrations)} entries to {output_file}", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()
