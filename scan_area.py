@@ -86,19 +86,30 @@ def metres_per_degree_lon(lat):
 
 
 def generate_grid(center_lat, center_lon, radius_m):
-    """Generate grid points covering a square of side 2*radius_m centred on the point.
+    """Generate grid points and per-query search radius for scanning a square area.
 
-    Uses a step size that ensures full coverage with 10km search circles.
-    The step is R*sqrt(2) ≈ 14.14km so that the corners of each grid cell
-    are within the search radius. We use a conservative 12km step for safety.
+    For small areas (radius <= 10km), returns a single centre point with
+    the exact radius. For larger areas, tiles the square with overlapping
+    10km-radius search circles using a step of 12km (ensuring corners of
+    each grid cell are within the search radius).
+
+    Returns (points, query_radius_m).
     """
-    step_m = GS_MAX_RADIUS * 1.2  # 12km step for good overlap with 10km search radius
+    if radius_m <= GS_MAX_RADIUS:
+        # Single query covers the whole area
+        return [(center_lat, center_lon)], int(radius_m)
 
-    # Convert step to degrees
+    # Multiple queries needed — tile with 10km search circles
+    query_radius = GS_MAX_RADIUS
+    # Step so that the corner of each cell is within the search radius:
+    # corner distance = step * sqrt(2)/2, must be <= query_radius
+    # => step <= query_radius * sqrt(2) ≈ 14.1km; use 12km for safety
+    step_m = query_radius * 1.2
+
     step_lat = step_m / metres_per_degree_lat()
-    step_lon = step_m / metres_per_degree_lon(center_lat) if metres_per_degree_lon(center_lat) > 0 else step_m / 1.0
+    m_per_deg_lon = metres_per_degree_lon(center_lat)
+    step_lon = step_m / m_per_deg_lon if m_per_deg_lon > 0 else step_m
 
-    # Number of steps in each direction from centre
     n_lat = math.ceil(radius_m / step_m)
     n_lon = math.ceil(radius_m / step_m)
 
@@ -107,19 +118,23 @@ def generate_grid(center_lat, center_lon, radius_m):
         for j in range(-n_lon, n_lon + 1):
             lat = center_lat + i * step_lat
             lon = center_lon + j * step_lon
-            # Clamp to valid ranges
             lat = max(-90.0, min(90.0, lat))
             lon = max(-180.0, min(180.0, lon))
             points.append((lat, lon))
 
-    return points
+    return points, query_radius
 
 
 def scan_area(center_lat, center_lon, radius_m):
     """Scan a square area and collect all unique Wikipedia geolocated entries."""
-    grid = generate_grid(center_lat, center_lon, radius_m)
+    grid, query_radius = generate_grid(center_lat, center_lon, radius_m)
     total_points = len(grid)
-    print(f"Scanning {total_points} grid points over {radius_m/1000:.1f}km radius...", file=sys.stderr)
+
+    if total_points == 1:
+        print(f"Single query, {radius_m/1000:.1f}km radius...", file=sys.stderr)
+    else:
+        print(f"Scanning {total_points} grid points over {radius_m/1000:.1f}km radius "
+              f"(each query: {query_radius/1000:.0f}km)...", file=sys.stderr)
 
     seen_pageids = set()
     all_entries = []
@@ -129,7 +144,7 @@ def scan_area(center_lat, center_lon, radius_m):
         print(f"  Grid point {idx}/{total_points}: ({lat:.4f}, {lon:.4f})", file=sys.stderr, end="")
 
         try:
-            results = geosearch(lat, lon, GS_MAX_RADIUS)
+            results = geosearch(lat, lon, query_radius)
         except Exception as e:
             print(f" ERROR: {e}", file=sys.stderr)
             continue
